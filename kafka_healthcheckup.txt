@@ -1,0 +1,259 @@
+pipeline {
+    agent any
+
+    environment {
+        KAFKA_HOME     = "/home/ratan/kafka/kafka_2.13-4.1.1"
+        KAFKA_BIN      = "/home/ratan/kafka/kafka_2.13-4.1.1/bin"
+        BOOTSTRAP      = "localhost:9092"
+        LAG_THRESHOLD  = "1"
+
+        // Dynamic topics to validate (comma separated)
+        /* TOPICS_TO_CHECK = "orders,payments,inventory" */
+            TOPICS_TO_CHECK = "test_topics"
+    }
+
+    stages {
+
+        /* ---------------------------------------------------------
+           1. CHECK KAFKA BROKER PORT (TCP LEVEL)
+        ------------------------------------------------------------ */
+        stage('Check Kafka Broker Status') {
+            steps {
+                script {
+                    echo "Checking if Kafka broker is reachable..."
+
+                    def status = sh(
+                        script: "bash -c 'echo > /dev/tcp/${BOOTSTRAP.split(':')[0]}/${BOOTSTRAP.split(':')[1]}'",
+                        returnStatus: true
+                    )
+
+                    if (status != 0) {
+                        error("❌ Kafka broker is DOWN on ${BOOTSTRAP}!")
+                    }
+
+                    echo "✔ Kafka broker is UP and reachable"
+                }
+            }
+        }
+
+        /* ---------------------------------------------------------
+           2. CHECK TOPICS EXIST (Dynamic Topics)
+        ------------------------------------------------------------ */
+        
+        stage('Check Required Topics') {
+    steps {
+        script {
+            echo "Checking if required topics exist..."
+
+            def existingTopics = sh(
+                script: """
+                    set +e
+                    ${KAFKA_BIN}/kafka-topics.sh --bootstrap-server ${BOOTSTRAP} --list 2>/dev/null || true
+                """,
+                returnStdout: true
+            )
+            .trim()
+            .split("\\R")
+            .collect { it.trim() }
+            .findAll { it }
+
+            TOPICS_TO_CHECK.split(",").each { topic ->
+                topic = topic.trim()
+                if (!existingTopics.contains(topic)) {
+                    echo "❌ Topic '${topic}' does NOT exist!"
+                    currentBuild.result = 'UNSTABLE'  // continue pipeline
+                } else {
+                    echo "✔ Topic '${topic}' exists"
+                }
+            }
+        }
+    }
+}
+
+/*        
+        stage('Check Required Topics') {
+    steps {
+        script {
+            echo "Checking if required topics exist..."
+
+            def existingTopics = sh(
+                script: """
+                    set +e
+                    ${KAFKA_BIN}/kafka-topics.sh --bootstrap-server ${BOOTSTRAP} --list 2>/dev/null || true
+                """,
+                returnStdout: true
+            )
+            .trim()
+            .split("\\R")                       // split by ANY newline
+            .collect { it.trim() }              // remove spaces
+            .findAll { it }                     // remove empty entries
+
+            echo "Topics from Kafka:\n${existingTopics}"
+
+            TOPICS_TO_CHECK.split(",").each { topic ->
+                topic = topic.trim()
+
+                if (!existingTopics.contains(topic)) {
+                    error("❌ Topic '${topic}' does NOT exist!")
+                } else {
+                    echo "✔ Topic '${topic}' exists"
+                }
+            }
+        }
+    }
+}
+*/
+/*
+
+        stage('Check Required Topics') {
+            steps {
+                script {
+                    echo "Checking if required topics exist..."
+
+                    def existingTopics = sh(
+                        script: "${KAFKA_BIN}/kafka-topics.sh --bootstrap-server ${BOOTSTRAP} --list || true",
+                        returnStdout: true
+                    ).trim().split("\n") as List
+
+                    TOPICS_TO_CHECK.split(",").each { topic ->
+                        if (!existingTopics.contains(topic)) {
+                            error("❌ Topic '${topic}' does NOT exist!")
+                        } else {
+                            echo "✔ Topic '${topic}' exists"
+                        }
+                    }
+                }
+            }
+        }
+*/
+        /* ---------------------------------------------------------
+           3. LIST & VERIFY CONSUMER GROUPS
+        ------------------------------------------------------------ */
+        stage('Check Consumer Groups') {
+            steps {
+                script {
+                    echo "Fetching consumer groups..."
+
+                    def groups = sh(
+                        script: "${KAFKA_BIN}/kafka-consumer-groups.sh --bootstrap-server ${BOOTSTRAP} --list || true",
+                        returnStdout: true
+                    ).trim()
+
+                    if (!groups) {
+                        echo "⚠ No consumer groups found."
+                        return
+                    }
+
+                    echo "✔ Consumer Groups Found:\n${groups}"
+                }
+            }
+        }
+
+        /* ---------------------------------------------------------
+           4. CHECK LAG FOR ALL GROUPS
+        ------------------------------------------------------------ */
+        stage('Check Consumer Lag') {
+            steps {
+                script {
+                    echo "Checking lag values for all consumer groups..."
+
+                    def output = sh(
+                        script: """
+                        ${KAFKA_BIN}/kafka-consumer-groups.sh \
+                        --bootstrap-server ${BOOTSTRAP} \
+                        --all-groups --describe 2>/dev/null || true
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    def lagValues = []
+
+                    output.readLines().each { line ->
+                        def cols = line.trim().split(/\s+/)
+                        if (cols.size() >= 6 && cols[5].isInteger()) {
+                            lagValues << cols[5].toInteger()
+                        }
+                    }
+
+                    if (lagValues.isEmpty()) {
+                        echo "⚠ No lag values found."
+                        return
+                    }
+
+                    def maxLag = lagValues.max()
+                    echo "Max Lag Detected: ${maxLag}"
+
+                    if (maxLag > LAG_THRESHOLD.toInteger()) {
+                        error("❌ Consumer lag (${maxLag}) exceeded threshold (${LAG_THRESHOLD})!")
+                    }
+
+                    echo "✔ Lag is within acceptable limits"
+                }
+            }
+        }
+
+        /* ---------------------------------------------------------
+           5. CHECK ACL PERMISSIONS
+        ------------------------------------------------------------ */
+        stage('Check Kafka ACLs') {
+            steps {
+                script {
+                    echo "Checking ACL permissions..."
+
+                    def aclOutput = sh(
+                        script: "${KAFKA_BIN}/kafka-acls.sh --authorizer-properties --bootstrap-server localhost:2181 --list|| true",
+                        returnStdout: true
+                    ).trim()
+
+                    if (!aclOutput) {
+                        echo "⚠ No ACLs found OR ACLs disabled."
+                    } else {
+                        echo "✔ ACLs configured:\n${aclOutput}"
+                    }
+                }
+            }
+        }
+
+        /* ---------------------------------------------------------
+           6. CHECK KAFKA SERVICES RUNNING
+           (Broker + Zookeeper/KRaft)
+        ------------------------------------------------------------ */
+        stage('Check Kafka Services') {
+            steps {
+                script {
+                    echo "Checking Kafka services..."
+
+                    def brokerService = sh(
+                        script: "ps -ef | grep kafka.Kafka | grep -v grep",
+                        returnStatus: true
+                    )
+
+                    if (brokerService != 0) {
+                        error("❌ Kafka Broker Process NOT running!")
+                    }
+
+                    echo "✔ Kafka Broker process is running"
+
+                    def zkService = sh(
+                        script: "ps -ef | grep QuorumPeerMain | grep -v grep",
+                        returnStatus: true
+                    )
+
+                    if (zkService != 0) {
+                        echo "⚠ Zookeeper not running (OK if using KRaft mode)"
+                    } else {
+                        echo "✔ Zookeeper service is running"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Kafka Monitoring Pipeline Completed"
+        }
+    }
+}
+
+
